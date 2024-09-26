@@ -8,6 +8,7 @@
 #include "Components/SphereComponent.h"
 #include "Components/AudioComponent.h"
 #include "Components/SceneComponent.h"
+#include "NiagaraComponent.h"
 
 // Base class for level controller
 // Level controller provides data saving and loading, enemy spawning and difficulty settings realisation
@@ -43,6 +44,18 @@ ABaseLevelController::ABaseLevelController()
 
 	DifficultyParameter = 0.5f;
 
+	StackState = EEnemyStackState::None;
+
+	SoftStackBeginEnemyCount = 35;
+	SoftStackEndEnemyCount = 30;
+
+	HardStackBeginEnemyCount = 45;
+	HardStackEndEnemyCount = 40;
+
+	EnemyStackQueryFrequency = 5.0f;
+
+	bIsHardStackActive = false;
+
 	DeathCountBounds = { 1, 3, 5, 10 };
 	DeathCountValues = { 1.0f, 0.7f, 0.5f, 0.3f };
 	DeathCountCost = 0.4f;
@@ -65,6 +78,9 @@ ABaseLevelController::ABaseLevelController()
 	EnemyDamageValues = { 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.5f, 1.5f };
 	EnemyNoticeRadiusValues = { 0.5f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.5f };
 	EnemyCountPercentageValues = { 0.3f, 0.3f, 0.7f, 0.7f, 1.0f, 1.0f, 1.0f };
+	EnemyLevelingPercentageValues = { 0.35f, 0.35f, 0.35f, 0.5f, 0.5f, 0.65f, 0.65f };
+
+	ChainDamageMultiplier = 0.25f;
 
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	RootComponent = Root;
@@ -83,6 +99,16 @@ ABaseLevelController::ABaseLevelController()
 	MusicRefreshFrequency = 2.0f;
 	MusicVolumeMultiplier = 0.25f;
 	MusicRefreshTimer = 0.0f;
+
+	ChainBoostNiagaraAsset = CreateDefaultSubobject<UNiagaraComponent>(TEXT("Chain Boost Niagara Asset"));
+	ChainBoostNiagaraAsset->SetupAttachment(RootComponent);
+	ChainBoostNiagaraAsset->SetAutoActivate(false);
+	ChainBoostNiagaraAsset->SetActive(false);
+
+	ChainBoostDamageNiagaraAsset = CreateDefaultSubobject<UNiagaraComponent>(TEXT("Chain Boost Damage Niagara Asset"));
+	ChainBoostDamageNiagaraAsset->SetupAttachment(RootComponent);
+	ChainBoostDamageNiagaraAsset->SetAutoActivate(false);
+	ChainBoostDamageNiagaraAsset->SetActive(false);
 }
 
 void ABaseLevelController::BeginPlay()
@@ -95,13 +121,20 @@ void ABaseLevelController::BeginPlay()
 	}
 	LoadLevelData();
 	DifficultyParameter = GetDifficultyParameter();
+	EnemyLevelingPercentage = GetOutputParameterFrom(DifficultyParameter, DifficultyParameterBounds, EnemyLevelingPercentageValues);
 	SpawnEnemies();
+
 	MusicCompExplore->SetVolumeMultiplier(((MusicParameter > 0.5f ? 0.0f : 1.0f - MusicParameter * 2.0f) + 0.001f) * MusicVolumeMultiplier);
 	MusicCompLow->SetVolumeMultiplier(((MusicParameter < 0.5f ? MusicParameter * 2.0f : 1.0f) + 0.001f) * MusicVolumeMultiplier);
 	MusicCompHigh->SetVolumeMultiplier(((MusicParameter < 0.5f ? 0.0f : (MusicParameter - 0.5f) * 2.0f) + 0.001f) * MusicVolumeMultiplier);
 	MusicCompExplore->Play();
 	MusicCompLow->Play();
 	MusicCompHigh->Play();
+
+	EnemyStackQuery();
+
+	SetActorLocation(FVector::ZeroVector);
+
 	Super::BeginPlay();
 }
 
@@ -124,6 +157,18 @@ void ABaseLevelController::Tick(float DeltaSeconds)
 		MusicCompLow->SetVolumeMultiplier(((MusicParameter < 0.5f ? MusicParameter * 2.0f : 1.0f) + 0.001f) * MusicVolumeMultiplier);
 		MusicCompHigh->SetVolumeMultiplier(((MusicParameter < 0.5f ? 0.0f : (MusicParameter - 0.5f) * 2.0f) + 0.001f) * MusicVolumeMultiplier);
 	}
+	if (ChainedEnemies.Num() > 0)
+	{
+		for (FChainBoostVFXData& Data : ChainVFXData)
+		{
+			Data.DefaultVFX->SetNiagaraVariableVec3("start_pos", Data.Enemy1->GetActorLocation());
+			Data.DefaultVFX->SetNiagaraVariableVec3("end_pos", Data.Enemy2->GetActorLocation());
+
+			Data.DamageVFX->SetNiagaraVariableVec3("start_pos", Data.Enemy1->GetActorLocation());
+			Data.DamageVFX->SetNiagaraVariableVec3("end_pos", Data.Enemy2->GetActorLocation());
+		}
+	}
+	Super::Tick(DeltaSeconds);
 }
 
 int ABaseLevelController::GetCurMapIndex() const
@@ -199,9 +244,9 @@ void ABaseLevelController::SpawnEnemies()
 	}
 }
 
-void ABaseLevelController::SpawnEnemy(class ABaseEnemySpawnPoint* SpawnPoint)
+void ABaseLevelController::SpawnEnemy(class ABaseEnemySpawnPoint* SpawnPoint, int Level, EEnemyLevelingType LevelingType)
 {
-	ABaseNPCSimpleChase* Enemy = SpawnPoint->SpawnEnemy();
+	ABaseNPCSimpleChase* Enemy = SpawnPoint->SpawnEnemy(Level, LevelingType);
 	if (Enemy)
 	{
 		Enemy->LevelController = this;
@@ -395,6 +440,208 @@ float ABaseLevelController::GetTargetMusicParameter() const
 	return 1.0f;
 }
 
+void ABaseLevelController::UpdateStackState()
+{
+	int EnemyCount = Player->GetEnemyChasingCount();
+
+	EEnemyStackState PreviousStackState = StackState;
+
+	if (EnemyCount < SoftStackEndEnemyCount)
+	{
+		StackState = EEnemyStackState::None;
+	}
+	else if ((StackState == EEnemyStackState::None && EnemyCount > SoftStackBeginEnemyCount && EnemyCount < HardStackBeginEnemyCount) || 
+			 (StackState == EEnemyStackState::HardStack && EnemyCount < HardStackEndEnemyCount))
+	{
+		StackState = EEnemyStackState::SoftStack;
+	}
+	else if (EnemyCount > HardStackBeginEnemyCount)
+	{
+		StackState = EEnemyStackState::HardStack;
+	}
+
+	if (PreviousStackState == EEnemyStackState::HardStack && StackState != EEnemyStackState::HardStack)
+	{
+		bIsHardStackActive = false;
+		HardStackDeactivationDelegate.Broadcast();
+	}
+}
+
+void ABaseLevelController::SoftStack()
+{
+	TArray<ABaseNPCSimpleChase*> EnemyChasing = Player->GetEnemyChasingArray();
+
+	if (!EnemyChasing.Num())
+	{
+		return;
+	}
+
+	int Index1 = FMath::RandRange(0, EnemyChasing.Num() - 1);
+	ABaseNPCSimpleChase* Enemy1 = EnemyChasing[Index1];
+	EnemyChasing.RemoveAt(Index1);
+
+	int Index2 = GetEnemyIndexWithMinDistance(EnemyChasing, Enemy1);
+
+	Enemy1->StackWith(EnemyChasing[Index2]);
+	EnemyChasing[Index2]->StackWith(Enemy1);
+}
+
+void ABaseLevelController::HardStack()
+{
+	if (bIsHardStackActive)
+	{
+		return;
+	}
+
+	bIsHardStackActive = true;
+
+	TArray<ABaseNPCSimpleChase*> EnemyChasing = Player->GetEnemyChasingArray();
+
+	while (EnemyChasing.Num() > 1)
+	{
+		ABaseNPCSimpleChase* Enemy1 = EnemyChasing.Pop();
+
+		int Index2 = GetEnemyIndexWithMinDistance(EnemyChasing, Enemy1);
+
+		ABaseNPCSimpleChase* Enemy2 = EnemyChasing[Index2];
+		EnemyChasing.RemoveAt(Index2);
+
+		Enemy1->StackWith(Enemy2);
+		Enemy2->StackWith(Enemy1);
+	}
+}
+
+void ABaseLevelController::EnemyStackQuery()
+{
+	if (StackState == EEnemyStackState::SoftStack)
+	{
+		SoftStack();
+	}
+	else if (StackState == EEnemyStackState::HardStack)
+	{
+		HardStack();
+	}
+
+	GetWorld()->GetTimerManager().SetTimer(EnemyStackQueryTimerHandle, this, &ABaseLevelController::EnemyStackQuery, EnemyStackQueryFrequency, false);
+}
+
+void ABaseLevelController::StackEnemies(ABaseNPCSimpleChase* Enemy1, ABaseNPCSimpleChase* Enemy2)
+{
+	if (Enemy1 == Enemy2)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Trying to stack enemy with itself!"));
+		return;
+	}
+
+	ABaseNPCSimpleChase* LowEnemy = Enemy1->GetEnemyLevel() < Enemy2->GetEnemyLevel() ? Enemy1 : Enemy2;
+	ABaseNPCSimpleChase* HighEnemy = LowEnemy == Enemy1 ? Enemy2 : Enemy1;
+
+	HighEnemy->IncreaseLevel(LowEnemy->GetEnemyLevel() + 1);
+	HighEnemy->Health = HighEnemy->MaxHealth;
+
+	HighEnemy->PlayStackVFX();
+
+	Player->RemoveEnemyChasing(LowEnemy);
+	RemoveEnemy(LowEnemy);
+	RemoveEnemyFromChain(LowEnemy);
+
+	LowEnemy->Destroy();
+}
+
+void ABaseLevelController::AddEnemyToChain(ABaseNPCSimpleChase* Enemy)
+{
+	if (ChainedEnemies.Contains(Enemy))
+	{
+		return;
+	}
+
+	ChainedEnemies.Add(Enemy);
+
+	TArray<ABaseNPCSimpleChase*> ChainedEnemiesArray = ChainedEnemies.Array();
+
+	ABaseNPCSimpleChase* Enemy2 = ChainedEnemiesArray.Num() == 1 ? Enemy : ChainedEnemiesArray[GetEnemyIndexWithMinDistance(ChainedEnemiesArray, Enemy)];
+
+	FChainBoostVFXData NewData;
+
+	NewData.Enemy1 = Enemy;
+	NewData.Enemy2 = Enemy2;
+
+	//FString ComponentName;
+	//ComponentName.AppendInt(reinterpret_cast<unsigned long long>(Enemy));
+	//ComponentName.AppendInt(reinterpret_cast<unsigned long long>(Enemy2));
+
+	FTransform NewTransform(FRotator::ZeroRotator, FVector::ZeroVector);
+
+	NewData.DefaultVFX = Cast<UNiagaraComponent>(AddComponentByClass(UNiagaraComponent::StaticClass(), false, NewTransform, false));
+	NewData.DefaultVFX->SetAsset(ChainBoostNiagaraAsset->GetAsset());
+
+	NewData.DamageVFX = Cast<UNiagaraComponent>(AddComponentByClass(UNiagaraComponent::StaticClass(), false, NewTransform, false));
+	NewData.DamageVFX->SetAsset(ChainBoostDamageNiagaraAsset->GetAsset());
+
+	ChainVFXData.Add(NewData);
+}
+
+void ABaseLevelController::RemoveEnemyFromChain(ABaseNPCSimpleChase* Enemy)
+{
+	if (!ChainedEnemies.Contains(Enemy))
+	{
+		return;
+	}
+
+	ChainedEnemies.Remove(Enemy);
+
+	int i = 0;
+	while (i < ChainVFXData.Num())
+	{
+		if (ChainVFXData[i].Enemy1 == Enemy || ChainVFXData[i].Enemy2 == Enemy)
+		{
+			ChainVFXData[i].DefaultVFX->DestroyComponent();
+			ChainVFXData[i].DamageVFX->DestroyComponent();
+			ChainVFXData.RemoveAt(i);
+		}
+		else
+		{
+			++i;
+		}
+	}
+}
+
+void ABaseLevelController::DealChainDamageExcept(class ABaseNPCSimpleChase* Enemy, float Damage)
+{
+	for (ABaseNPCSimpleChase* ChainedEnemy : ChainedEnemies)
+	{
+		if (ChainedEnemy != Enemy)
+		{
+			ChainedEnemy->TakeDamage(Damage * ChainDamageMultiplier, true);
+		}
+	}
+}
+
+int GetEnemyIndexWithMinDistance(const TArray<ABaseNPCSimpleChase*>& Enemies, ABaseNPCSimpleChase* EnemyToCompare)
+{
+	FVector Location = EnemyToCompare->GetActorLocation();
+
+	float MinDistance = FVector::Distance(Enemies[0]->GetActorLocation(), Location);
+	int Index = 0;
+
+	for (int i = 1; i < Enemies.Num(); ++i)
+	{
+		if (Enemies[i] == EnemyToCompare)
+		{
+			continue;
+		}
+
+		float Distance = FVector::Distance(Enemies[i]->GetActorLocation(), Location);
+		if (Distance < MinDistance)
+		{
+			MinDistance = Distance;
+			Index = i;
+		}
+	}
+
+	return Index;
+}
+
 FString ABaseLevelController::GetScoreboard(int Num)
 {
 	ReadScoreboardData();
@@ -492,6 +739,8 @@ FString ABaseLevelController::GetDifficultyBrief() const
 	Result += FString("\nNotice radius: x") + FloatToFString(GetOutputParameterFrom(DifficultyParameter, DifficultyParameterBounds, EnemyNoticeRadiusValues));
 	Result += FString("\nEnemy Count: ");
 	Result.AppendInt(int(GetOutputParameterFrom(DifficultyParameter, DifficultyParameterBounds, EnemyCountPercentageValues) * 100.0f));
+	Result += FString("%\nEnemy Leveling: ");
+	Result.AppendInt(int(EnemyLevelingPercentage * 100.0f));
 	Result.AppendChar('%');
 	return Result;
 }

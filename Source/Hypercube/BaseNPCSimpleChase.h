@@ -65,11 +65,25 @@ enum class EEnemyAction : uint8
 	SlowDebuff UMETA(DisplayName = "SlowDebuff"),
 	SlowDebuffEnd UMETA(DisplayName = "SlowDebuffEnd"),
 	DamageDecreaseDebuff UMETA(DisplayName = "AttackDecreaseDebuff"),
-	DamageDecreaseDebuffEnd UMETA(DisplayName = "AttackDecreaseDebuffEnd")
+	DamageDecreaseDebuffEnd UMETA(DisplayName = "AttackDecreaseDebuffEnd"),
+	HealBuff UMETA(DisplayName = "HealBuff"),
+	HealBurst UMETA(DisplayName = "HealBurst"),
+	HealBuffEnd UMETA(DisplayName = "HealBuffEnd"),
+	LevelUpdate UMETA(DisplayName = "LevelUpdate")
+};
+
+UENUM(BlueprintType)
+enum class EEnemyLevelingType : uint8
+{
+	None UMETA(DisplayName = "None"),
+	Speed UMETA(DisplayName = "Speed"),
+	Damage UMETA(DisplayName = "Damage"),
+	Health UMETA(DisplayName = "Health")
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnEnemyDeath);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnEnemyAction, EEnemyAction, Action, bool, Success);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEnemyStackQuery, ABaseNPCSimpleChase*, OtherEnemy);
 
 UCLASS()
 class HYPERCUBE_API ABaseNPCSimpleChase : public ACharacter
@@ -95,6 +109,12 @@ class HYPERCUBE_API ABaseNPCSimpleChase : public ACharacter
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Camera, meta = (AllowPrivateAccess = "true"))
 	class UStaticMeshComponent* DebugDamageIndicator;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Particles, meta = (AllowPrivateAccess = "true"))
+	class UParticleSystemComponent* HealBuffParticleSystem;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Particles, meta = (AllowPrivateAccess = "true"))
+	class UParticleSystemComponent* StackParticleSystem;
+
 public:
 
 	ABaseNPCSimpleChase();
@@ -108,11 +128,18 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = EventDispatchers)
 	FOnEnemyAction EnemyActionDelegate;
 
+	UPROPERTY(BlueprintAssignable, Category = EventDispatchers)
+	FOnEnemyStackQuery EnemyStackQueryDelegate;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | Health")
 	float Health;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | Health")
 	float MaxHealth;
+
+	// Time between heal bursts while healing
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | Health")
+	float HealBurstTimeBetween;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | Jump")
 	float JumpTime;
@@ -140,12 +167,26 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | Unstuck")
 	int MaxAttempsToUnstuck;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Stats | VFX")
+	float StackVFXTime;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	bool bIsDebugOn;
 
 	// Time for which debug damage indicator becames visible
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
 	float DebugDamageIndicatorTime;
+
+protected:
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Stats | Leveling", meta = (AllowPrivateAccess = "true"))
+	int Level;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Stats | Leveling", meta = (AllowPrivateAccess = "true"))
+	EEnemyLevelingType LevelingType;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Stats | Effects", meta = (AllowPrivateAccess = "true"))
+	bool bIsChained;
 
 protected:
 
@@ -157,7 +198,7 @@ protected:
 
 	FTimerHandle AttackTimerHandle;
 	EAttackPhase AttackPhase;
-	class AHypercubeCharacter* AttackTarget;
+	class AHypercubeCharacter* Player;
 
 	// Dealayed initialization
 	FTimerHandle DelayedInitTimerHandle;
@@ -197,6 +238,22 @@ protected:
 	float BaseDamage;
 	void OnEndDamageDebuff();
 
+	float HealPerBurst;
+	float HealRemaining;
+	bool bIsHealing;
+	FTimerHandle HealBuffTimerHandle;
+	void HealBurst();
+	void OnEndHealBuff();
+
+	FTimerHandle StackVFXTimerHandle;
+	void OnEndStackVFX();
+
+	FTimerHandle ChainBoostTimerHandle;
+	void OnEndChainBoost();
+
+	void ResetLevel();
+
+
 	FTimerHandle CheckPlayerSightTimerHandle;
 
 public:
@@ -207,8 +264,11 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure)
 	FORCEINLINE class USphereComponent* GetNoticeCollision() const { return NoticeCollision; }
 
+	UFUNCTION(BlueprintCallable, BlueprintPure)
+	FORCEINLINE int GetEnemyLevel() const { return Level; }
+
 	UFUNCTION(BlueprintCallable)
-	void TakeDamage(float Damage);
+	void TakeDamage(float Damage, bool bIgnoreChain = false);
 
 	UFUNCTION(BlueprintCallable)
 	void OnNotice();
@@ -230,6 +290,9 @@ public:
 	UFUNCTION(BlueprintCallable)
 	void SetDamageDebuff(float Mult, float Time);
 
+	UFUNCTION(BlueprintCallable)
+	void SetHealBuff(float Heal, int BurstCount);
+
 	// True if player camera has sight on this NPC
 	UFUNCTION(BlueprintCallable, BlueprintPure)
 	bool PlayerHasSightOn() const;
@@ -237,4 +300,27 @@ public:
 	// Called when NPC is stuck and player is not seeing it. Teleports NPC near plauyer out of his sight
 	UFUNCTION(BlueprintCallable)
 	void Unstuck();
+
+	// Get stat multiplier according to enemy level
+	UFUNCTION(BlueprintCallable, BlueprintPure)
+	float GetStatMultiplier() const;
+
+	// How does Damage multiplier increase multiplies according to enemy level
+	UFUNCTION(BlueprintCallable, BlueprintPure)
+	float GetDamageMultiplierMultiplier() const;
+
+	UFUNCTION(BlueprintCallable)
+	void SetLevel(int NewLevel, EEnemyLevelingType NewLevelingType);
+
+	UFUNCTION(BlueprintCallable)
+	void IncreaseLevel(int ToIncrease);
+
+	UFUNCTION(BlueprintCallable)
+	void StackWith(ABaseNPCSimpleChase* OtherEnemy);
+
+	UFUNCTION(BlueprintCallable)
+	void PlayStackVFX();
+
+	UFUNCTION(BlueprintCallable)
+	void SetChainBoost(float Time);
 };
